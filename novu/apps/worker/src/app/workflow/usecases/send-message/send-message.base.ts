@@ -1,0 +1,316 @@
+import { Logger } from '@nestjs/common';
+import { ModuleRef } from '@nestjs/core';
+import {
+  CreateExecutionDetails,
+  CreateExecutionDetailsCommand,
+  createProviderSelectedMessage,
+  DetailEnum,
+  GetNovuProviderCredentials,
+  Instrument,
+  SelectIntegration,
+  SelectIntegrationCommand,
+  SelectVariant,
+  SelectVariantCommand,
+} from '@novu/application-generic';
+import {
+  IntegrationEntity,
+  JobEntity,
+  MessageRepository,
+  MessageTemplateEntity,
+  SubscriberRepository,
+} from '@novu/dal';
+import {
+  ChannelTypeEnum,
+  ChatProviderIdEnum,
+  EmailProviderIdEnum,
+  ExecutionDetailsSourceEnum,
+  ExecutionDetailsStatusEnum,
+  ITenantDefine,
+  ProviderFailureCategoryEnum,
+  ProvidersIdEnum,
+  providers,
+  SmsProviderIdEnum,
+  TriggerOverrides,
+} from '@novu/shared';
+import { format } from 'date-fns';
+import i18next from 'i18next';
+import { merge } from 'lodash';
+import { PlatformException, TRANSLATIONS_SERVICE } from '../../../shared/utils';
+import { SendMessageChannelCommand } from './send-message-channel.command';
+import { SendMessageResult, SendMessageStatus, SendMessageType } from './send-message-type.usecase';
+
+export abstract class SendMessageBase extends SendMessageType {
+  private static providerRateLimitWindows = new Map<string, number[]>();
+
+  abstract readonly channelType: ChannelTypeEnum;
+  protected constructor(
+    protected messageRepository: MessageRepository,
+    protected createExecutionDetails: CreateExecutionDetails,
+    protected subscriberRepository: SubscriberRepository,
+    protected selectIntegration: SelectIntegration,
+    protected getNovuProviderCredentials: GetNovuProviderCredentials,
+    protected selectVariant: SelectVariant,
+    protected moduleRef: ModuleRef
+  ) {
+    super(messageRepository, createExecutionDetails);
+  }
+
+  protected combineOverrides(
+    bridgeData: Record<string, any> | null | undefined,
+    overrides: TriggerOverrides | undefined,
+    stepId: string | undefined,
+    integrationId: string
+  ): Record<string, unknown> {
+    const bridgeProviderData = bridgeData?.providers?.[integrationId] || {};
+    const workflowGlobalProviderOverrides = overrides?.providers?.[integrationId] || {};
+    const triggerOverrides = stepId ? overrides?.steps?.[stepId]?.providers?.[integrationId] || {} : {};
+
+    return merge({}, bridgeProviderData, workflowGlobalProviderOverrides, triggerOverrides);
+  }
+
+  @Instrument()
+  protected async getIntegration(params: {
+    id?: string;
+    providerId?: ProvidersIdEnum;
+    identifier?: string;
+    organizationId: string;
+    environmentId: string;
+    channelType: ChannelTypeEnum;
+    userId: string;
+    recipientEmail?: string;
+    filterData: {
+      tenant: ITenantDefine | undefined;
+    };
+  }): Promise<IntegrationEntity | undefined> {
+    const integration = await this.selectIntegration.execute(SelectIntegrationCommand.create(params));
+
+    if (!integration) {
+      return;
+    }
+
+    if (
+      integration.providerId === EmailProviderIdEnum.Novu ||
+      integration.providerId === SmsProviderIdEnum.Novu ||
+      integration.providerId === ChatProviderIdEnum.Novu
+    ) {
+      integration.credentials = await this.getNovuProviderCredentials.execute({
+        channelType: integration.channel,
+        providerId: integration.providerId,
+        environmentId: integration._environmentId,
+        organizationId: integration._organizationId,
+        userId: params.userId,
+        recipientEmail: params.recipientEmail,
+      });
+    }
+
+    return integration;
+  }
+
+  protected async getFailoverIntegration(params: {
+    originalIntegration: IntegrationEntity;
+    failureCategory: ProviderFailureCategoryEnum;
+    organizationId: string;
+    environmentId: string;
+    channelType: ChannelTypeEnum;
+    userId: string;
+    recipientEmail?: string;
+    filterData: {
+      tenant: ITenantDefine | undefined;
+    };
+  }): Promise<IntegrationEntity | undefined> {
+    const failover = params.originalIntegration.operations?.failover;
+    if (!failover?.enabled || !failover.fallbackIntegrationIds?.length) {
+      return undefined;
+    }
+
+    const eligibleCategories = failover.failureCategories || [];
+    if (eligibleCategories.length > 0 && !eligibleCategories.includes(params.failureCategory)) {
+      return undefined;
+    }
+
+    for (const fallbackIntegrationId of failover.fallbackIntegrationIds) {
+      const fallback = await this.getIntegration({
+        id: fallbackIntegrationId,
+        organizationId: params.organizationId,
+        environmentId: params.environmentId,
+        channelType: params.channelType,
+        userId: params.userId,
+        recipientEmail: params.recipientEmail,
+        filterData: params.filterData,
+      });
+
+      if (fallback) {
+        return fallback;
+      }
+    }
+
+    return undefined;
+  }
+
+  protected async isProviderRateLimited(
+    integration: IntegrationEntity,
+    command: SendMessageChannelCommand,
+    messageId?: string
+  ): Promise<boolean> {
+    const rateLimit = integration.operations?.rateLimit;
+    if (!rateLimit?.enabled || !rateLimit.maxPerWindow || !rateLimit.windowMs) {
+      return false;
+    }
+
+    const now = Date.now();
+    const key = `${integration._environmentId}:${integration._id}`;
+    const recentTimestamps = (SendMessageBase.providerRateLimitWindows.get(key) || []).filter(
+      (timestamp) => now - timestamp < rateLimit.windowMs
+    );
+
+    if (recentTimestamps.length >= rateLimit.maxPerWindow) {
+      await this.createExecutionDetails.execute(
+        CreateExecutionDetailsCommand.create({
+          ...CreateExecutionDetailsCommand.getDetailsFromJob(command.job),
+          ...(messageId && { messageId }),
+          detail: DetailEnum.THROTTLE_LIMIT_EXCEEDED,
+          source: ExecutionDetailsSourceEnum.INTERNAL,
+          status: ExecutionDetailsStatusEnum.WARNING,
+          isTest: false,
+          isRetry: false,
+          raw: JSON.stringify({
+            providerId: integration.providerId,
+            integrationId: integration._id,
+            maxPerWindow: rateLimit.maxPerWindow,
+            windowMs: rateLimit.windowMs,
+          }),
+        })
+      );
+
+      return true;
+    }
+
+    SendMessageBase.providerRateLimitWindows.set(key, [...recentTimestamps, now]);
+
+    return false;
+  }
+
+  protected storeContent(): boolean {
+    return this.channelType === ChannelTypeEnum.IN_APP || process.env.STORE_NOTIFICATION_CONTENT === 'true';
+  }
+
+  protected getCompilePayload(compileContext) {
+    const { payload, ...rest } = compileContext;
+
+    return { ...payload, ...rest };
+  }
+
+  protected async sendErrorHandlebars(job: JobEntity, error: string): Promise<SendMessageResult> {
+    await this.createExecutionDetails.execute(
+      CreateExecutionDetailsCommand.create({
+        ...CreateExecutionDetailsCommand.getDetailsFromJob(job),
+        detail: DetailEnum.MESSAGE_CONTENT_NOT_GENERATED,
+        source: ExecutionDetailsSourceEnum.INTERNAL,
+        status: ExecutionDetailsStatusEnum.FAILED,
+        isTest: false,
+        isRetry: false,
+        raw: JSON.stringify({ error }),
+      })
+    );
+
+    return {
+      status: SendMessageStatus.FAILED,
+      errorMessage: DetailEnum.MESSAGE_CONTENT_NOT_GENERATED,
+    };
+  }
+
+  @Instrument()
+  protected async sendSelectedIntegrationExecution(job: JobEntity, integration: IntegrationEntity) {
+    const providerDisplayName = providers.find((el) => el.id === integration?.providerId)?.displayName || 'Unknown';
+
+    await this.createExecutionDetails.execute(
+      CreateExecutionDetailsCommand.create({
+        ...CreateExecutionDetailsCommand.getDetailsFromJob(job),
+        detail: createProviderSelectedMessage(providerDisplayName) as DetailEnum,
+        source: ExecutionDetailsSourceEnum.INTERNAL,
+        status: ExecutionDetailsStatusEnum.PENDING,
+        isTest: false,
+        isRetry: false,
+        raw: JSON.stringify({
+          providerId: integration?.providerId,
+          identifier: integration?.identifier,
+          name: integration?.name,
+          _environmentId: integration?._environmentId,
+          _id: integration?._id,
+        }),
+      })
+    );
+  }
+
+  @Instrument()
+  protected async processVariants(command: SendMessageChannelCommand): Promise<MessageTemplateEntity> {
+    const { messageTemplate, conditions } = await this.selectVariant.execute(
+      SelectVariantCommand.create({
+        organizationId: command.organizationId,
+        environmentId: command.environmentId,
+        userId: command.userId,
+        step: command.step,
+        job: command.job,
+        filterData: command.compileContext ?? {},
+      })
+    );
+
+    if (conditions) {
+      await this.createExecutionDetails.execute(
+        CreateExecutionDetailsCommand.create({
+          ...CreateExecutionDetailsCommand.getDetailsFromJob(command.job),
+          detail: DetailEnum.VARIANT_CHOSEN,
+          source: ExecutionDetailsSourceEnum.INTERNAL,
+          status: ExecutionDetailsStatusEnum.PENDING,
+          isTest: false,
+          isRetry: false,
+          raw: JSON.stringify({ conditions }),
+        })
+      );
+    }
+
+    return messageTemplate;
+  }
+
+  @Instrument()
+  protected async initiateTranslations(environmentId: string, organizationId: string, locale: string | undefined) {
+    try {
+      if (process.env.NOVU_ENTERPRISE === 'true' || process.env.CI_EE_TEST === 'true') {
+        if (!this.moduleRef.get(TRANSLATIONS_SERVICE, { strict: false })) {
+          throw new PlatformException('Translation module is not loaded');
+        }
+        const service = this.moduleRef.get(TRANSLATIONS_SERVICE, { strict: false });
+        const { namespaces, resources, defaultLocale } = await service.getTranslationsList(
+          environmentId,
+          organizationId
+        );
+
+        const instance = i18next.createInstance({
+          resources,
+          ns: namespaces,
+          defaultNS: false,
+          nsSeparator: '.',
+          lng: locale || 'en',
+          compatibilityJSON: 'v2',
+          fallbackLng: defaultLocale || 'en',
+          interpolation: {
+            formatSeparator: ',',
+            format(value, formatting, lng) {
+              if (value && formatting && !Number.isNaN(Date.parse(value))) {
+                return format(new Date(value), formatting);
+              }
+
+              return String(value ?? '');
+            },
+          },
+        });
+
+        await instance.init();
+
+        return instance;
+      }
+    } catch (e) {
+      Logger.error(e, `Unexpected error while importing enterprise modules`, 'TranslationsService');
+    }
+  }
+}

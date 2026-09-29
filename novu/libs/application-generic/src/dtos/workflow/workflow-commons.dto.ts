@@ -1,0 +1,73 @@
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { IsArray, IsBoolean, IsObject, IsOptional, IsString } from 'class-validator';
+import { IsValidJsonSchema } from '../../decorators/json-schema.validator';
+
+export class WorkflowCommonsFields {
+  @ApiProperty({ description: 'Name of the workflow' })
+  @IsString()
+  name: string;
+
+  @ApiPropertyOptional({ description: 'Description of the workflow', required: false })
+  @IsOptional()
+  @IsString()
+  description?: string;
+
+  @ApiPropertyOptional({
+    description: 'Tags associated with the workflow',
+    type: [String],
+    required: false,
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  tags?: string[];
+
+  @ApiPropertyOptional({
+    description: 'Whether the workflow is active',
+    required: false,
+    default: false,
+  })
+  @IsOptional()
+  @IsBoolean()
+  active?: boolean;
+
+  @ApiPropertyOptional({
+    description: 'Enable or disable payload schema validation',
+    type: 'boolean',
+  })
+  @IsOptional()
+  @IsBoolean()
+  validatePayload?: boolean;
+
+  @ApiPropertyOptional({
+    description: 'The payload JSON Schema for the workflow',
+    nullable: true,
+    type: 'object',
+    additionalProperties: true,
+  })
+  @IsOptional()
+  @IsValidJsonSchema({
+    message: 'payloadSchema must be a valid JSON schema',
+    nullable: true,
+  })
+  payloadSchema?: object | null;
+
+  @ApiPropertyOptional({
+    description: 'Enable or disable translations for this workflow',
+    required: false,
+    default: false,
+  })
+  @IsOptional()
+  @IsBoolean()
+  isTranslationEnabled?: boolean;
+
+  @ApiPropertyOptional({
+    description: 'Workflow-level reliability controls for retry, deduplication, rate limiting, and default priority.',
+    required: false,
+    type: 'object',
+    additionalProperties: true,
+  })
+  @IsOptional()
+  @IsObject()
+  reliability?: Record<string, unknown>;
+}

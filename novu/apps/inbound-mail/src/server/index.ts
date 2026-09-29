@@ -1,0 +1,584 @@
+import fs from 'node:fs';
+import { BullMqService } from '@novu/application-generic';
+import Promise from 'bluebird';
+import dns from 'dns';
+import events from 'events';
+import extend from 'extend';
+import { convert } from 'html-to-text';
+import _ from 'lodash';
+import { MailParser } from 'mailparser';
+import path from 'path';
+import shell from 'shelljs';
+import { SMTPServer } from 'smtp-server';
+import util from 'util';
+import { v4 as uuidv4 } from 'uuid';
+
+import { InboundMailService } from './inbound-mail.service';
+import logger from './logger';
+
+const LOG_CONTEXT = 'Mailin';
+
+const LanguageDetect = require('languagedetect');
+const mailUtilities = Promise.promisifyAll(require('./mailUtilities'));
+
+const inboundMailService = new InboundMailService();
+BullMqService.haveProInstalled();
+
+class Mailin extends events.EventEmitter {
+  public configuration: IConfiguration;
+
+  private _smtp: SMTPServer;
+
+  constructor() {
+    super();
+
+    this.configuration = {
+      host: '127.0.0.1',
+      port: 2500,
+      tmp: '.tmp',
+      disableWebhook: true,
+      disableDkim: false,
+      disableSpf: false,
+      disableSpamScore: false,
+      verbose: false,
+      debug: false,
+      logLevel: 'info',
+      profile: false,
+      disableDNSValidation: true,
+      smtpOptions: {
+        banner: 'Mailin Smtp Server',
+        logger: false,
+        disabledCommands: ['AUTH'],
+      },
+    };
+    this._smtp = null;
+  }
+
+  public async start(options: object, callback: (err?) => void) {
+    const _this = this;
+
+    const { configuration } = this;
+    extend(true, configuration, options);
+
+    if (!configuration.smtpOptions) {
+      configuration.smtpOptions = {} as ISmtpOptions;
+    }
+
+    configuration.smtpOptions.secure = configuration.smtpOptions?.secure
+      ? Boolean(configuration.smtpOptions.secure)
+      : false;
+
+    callback = callback || (() => {});
+
+    /* Create tmp dir if necessary. */
+    if (!fs.existsSync(configuration.tmp)) {
+      shell.mkdir('-p', configuration.tmp);
+    }
+
+    /* Basic memory profiling. */
+    if (configuration.profile) {
+      logger.info({ context: LOG_CONTEXT }, 'Enable memory profiling');
+      setInterval(() => {
+        const memoryUsage = process.memoryUsage();
+        const ram = memoryUsage.rss + memoryUsage.heapUsed;
+        const million = 1000000;
+        logger.info(
+          { context: LOG_CONTEXT },
+          `Ram Usage: ${ram / million}mb | rss: ${memoryUsage.rss / million}mb | heapTotal: ${
+            memoryUsage.heapTotal / million
+          }mb | heapUsed: ${memoryUsage.heapUsed / million}`
+        );
+      }, 500);
+    }
+
+    function validateAddress(addressType, email, envelope) {
+      return new Promise((resolve, reject) => {
+        if (configuration.disableDnsLookup) {
+          return resolve();
+        }
+        try {
+          let validateEvent;
+          let validationFailedEvent;
+          let dnsErrorMessage;
+          let localErrorMessage;
+
+          if (addressType === 'sender') {
+            validateEvent = 'validateSender';
+            validationFailedEvent = 'senderValidationFailed';
+            dnsErrorMessage = `450 4.1.8 <${email}>: Sender address rejected: Domain not found`;
+            localErrorMessage = `550 5.1.1 <${email}>: Sender address rejected: User unknown in local sender table`;
+          } else if (addressType === 'recipient') {
+            validateEvent = 'validateRecipient';
+            validationFailedEvent = 'recipientValidationFailed';
+            dnsErrorMessage = `450 4.1.8 <${email}>: Recipient address rejected: Domain not found`;
+            localErrorMessage = `550 5.1.1 <${email}>: Recipient address rejected: User unknown in local recipient table`;
+          } else {
+            // How are internal errors handled?
+            return reject(new Error('Address type not supported'));
+          }
+
+          if (!email) {
+            return reject(new Error(localErrorMessage));
+          }
+
+          const domain = /@(.*)/.exec(email)[1];
+
+          const validateViaLocal = () => {
+            if (_this.listeners(validateEvent).length) {
+              _this.emit(validateEvent, envelope, email, (err) => {
+                if (err) {
+                  _this.emit(validationFailedEvent, email);
+
+                  return reject(new Error(localErrorMessage));
+                } else {
+                  return resolve();
+                }
+              });
+            } else {
+              return resolve();
+            }
+          };
+
+          const validateViaDNS = () => {
+            try {
+              dns.resolveMx(domain, (err, addresses) => {
+                if (err || !addresses || !addresses.length) {
+                  _this.emit(validationFailedEvent, email);
+
+                  return reject(new Error(dnsErrorMessage));
+                }
+                validateViaLocal();
+              });
+            } catch (e) {
+              logger.error({ err: e, context: LOG_CONTEXT }, 'Exception occurred while validating DNS');
+              return reject(new Error(e));
+            }
+          };
+
+          if (configuration.disableDNSValidation) {
+            validateViaLocal();
+          } else {
+            validateViaDNS();
+          }
+        } catch (e) {
+          logger.error({ err: e, context: LOG_CONTEXT }, 'Exception occurred while validating address');
+          reject(e);
+        }
+      });
+    }
+
+    function dataReady(connection) {
+      logger.info(
+        { context: LOG_CONTEXT, connectionId: connection.id },
+        `${connection.id} Processing message from ${connection.envelope.mailFrom.address}`
+      );
+
+      return retrieveRawEmail(connection)
+        .then((rawEmail) =>
+          Promise.all([
+            rawEmail,
+            validateDkim(connection, rawEmail),
+            validateSpf(connection),
+            computeSpamScore(connection, rawEmail),
+            parseEmail(connection),
+          ])
+        )
+        .then(([rawEmail, isDkimValid, isSpfValid, spamScore, parsedEmail]) =>
+          Promise.all([
+            connection,
+            rawEmail,
+            isDkimValid,
+            isSpfValid,
+            spamScore,
+            parsedEmail,
+            detectLanguage(connection, parsedEmail.text),
+          ])
+        )
+        .then(function ([connectionFinalize, rawEmail, isDkimValid, isSpfValid, spamScore, parsedEmail, language]) {
+          const args = [connectionFinalize, rawEmail, isDkimValid, isSpfValid, spamScore, parsedEmail, language];
+
+          return finalizeMessage.apply(this, args);
+        })
+        .then(postQueue.bind(null, connection))
+        .then(unlinkFile.bind(null, connection))
+        .catch((error) => {
+          logger.error(
+            { err: error, context: LOG_CONTEXT, connectionId: connection.id },
+            `${connection.id} Unable to finish processing message!!`
+          );
+          throw error;
+        });
+    }
+
+    function retrieveRawEmail(connection) {
+      return fs.promises.readFile(connection.mailPath).then((rawEmail) => rawEmail.toString());
+    }
+
+    function validateDkim(connection, rawEmail) {
+      if (configuration.disableDkim) {
+        return Promise.resolve(false);
+      }
+
+      logger.verbose({ context: LOG_CONTEXT, connectionId: connection.id }, `${connection.id} Validating dkim.`);
+
+      return mailUtilities.validateDkimAsync(rawEmail).catch((err) => {
+        logger.error(
+          { err, context: LOG_CONTEXT, connectionId: connection.id },
+          `${connection.id} Unable to validate dkim. Consider dkim as failed.`
+        );
+
+        return false;
+      });
+    }
+
+    function validateSpf(connection) {
+      if (configuration.disableSpf) {
+        return Promise.resolve(false);
+      }
+
+      logger.verbose({ context: LOG_CONTEXT, connectionId: connection.id }, `${connection.id} Validating spf.`);
+
+      /* Get ip and host. */
+      return mailUtilities
+        .validateSpfAsync(connection.remoteAddress, connection.from, connection.clientHostname)
+        .catch((err) => {
+          logger.error(
+            { err, context: LOG_CONTEXT, connectionId: connection.id },
+            `${connection.id} Unable to validate spf. Consider spf as failed.`
+          );
+
+          return false;
+        });
+    }
+
+    function computeSpamScore(connection, rawEmail) {
+      if (configuration.disableSpamScore) {
+        return Promise.resolve(0.0);
+      }
+
+      return mailUtilities.computeSpamScoreAsync(rawEmail).catch((err) => {
+        logger.error(
+          { err, context: LOG_CONTEXT, connectionId: connection.id },
+          `${connection.id} Unable to compute spam score. Set spam score to 0.`
+        );
+
+        return 0.0;
+      });
+    }
+
+    function parseEmail(connection) {
+      return new Promise((resolve) => {
+        logger.verbose({ context: LOG_CONTEXT, connectionId: connection.id }, `${connection.id} Parsing email.`);
+
+        /* Prepare the mail parser. */
+        const mailParser = new MailParser();
+
+        mailParser.on('end', (mail) => {
+          /*
+           * logger.verbose(util.inspect(mail, {
+           * depth: 5
+           * }));
+           */
+
+          /*
+           * Make sure that both text and html versions of the
+           * body are available.
+           */
+          if (!mail.text && !mail.html) {
+            mail.text = '';
+            mail.html = '<div></div>';
+          } else if (!mail.html) {
+            mail.html = _this._convertTextToHtml(mail.text);
+          } else if (!mail.text) {
+            mail.text = _this._convertHtmlToText(mail.html);
+          }
+
+          return resolve(mail);
+        });
+
+        /* Stream the written email to the parser. */
+        fs.createReadStream(connection.mailPath).pipe(mailParser);
+      });
+    }
+
+    function detectLanguage(connection, text) {
+      logger.verbose({ context: LOG_CONTEXT, connectionId: connection.id }, `${connection.id} Detecting language.`);
+
+      let language = '';
+
+      const languageDetector = new LanguageDetect();
+      const potentialLanguages = languageDetector.detect(text, 2);
+      if (potentialLanguages.length !== 0) {
+        logger.verbose(
+          { context: LOG_CONTEXT, connectionId: connection.id },
+          `Potential languages: ${util.inspect(potentialLanguages, {
+            depth: 5,
+          })}`
+        );
+
+        /*
+         * Use the first detected language.
+         * potentialLanguages = [['english', 0.5969], ['hungarian', 0.40563]]
+         */
+        language = potentialLanguages[0][0];
+      } else {
+        logger.info(
+          { context: LOG_CONTEXT, connectionId: connection.id },
+          `${connection.id} Unable to detect language for the current message.`
+        );
+      }
+
+      return language;
+    }
+
+    function finalizeMessage(connection, rawEmail, isDkimValid, isSpfValid, spamScore, parsedEmail, language) {
+      /* Finalize the parsed email object. */
+      parsedEmail.dkim = isDkimValid ? 'pass' : 'failed';
+      parsedEmail.spf = isSpfValid ? 'pass' : 'failed';
+      parsedEmail.spamScore = spamScore;
+      parsedEmail.language = language;
+
+      /*
+       * Make fields exist, even if empty. That will make
+       * json easier to use on the webhook receiver side.
+       */
+      parsedEmail.cc = parsedEmail.cc || [];
+      // parsedEmail.attachments = parsedEmail.attachments || [];
+
+      /* Add the connection authentication to the parsedEmail. */
+      parsedEmail.connection = connection;
+
+      /* Add envelope data to the parsedEmail. */
+      parsedEmail.envelopeFrom = connection.envelope.mailFrom;
+      parsedEmail.envelopeTo = connection.envelope.rcptTo;
+
+      /*
+       * Preserve threading headers so downstream consumers can correlate
+       * replies back to the original outbound message.
+       * mailparser@0.6.x stores both fields as string[] — normalise them to
+       * the shapes expected by IInboundParseDataDto / InboundEmailParseCommand
+       * so class-validator's @IsString() / @IsOptional() passes correctly.
+       * inReplyTo  → string | null  (RFC 5322 allows only one message-id)
+       * references → string[] | null
+       */
+      parsedEmail.inReplyTo = Array.isArray(parsedEmail.inReplyTo)
+        ? (parsedEmail.inReplyTo[0] ?? null)
+        : (parsedEmail.inReplyTo ?? null);
+
+      parsedEmail.references = Array.isArray(parsedEmail.references)
+        ? parsedEmail.references.length > 0
+          ? parsedEmail.references
+          : null
+        : (parsedEmail.references ?? null);
+
+      _this.emit('message', connection, parsedEmail, rawEmail);
+
+      return parsedEmail;
+    }
+
+    function postQueue(connection, finalizedMessage) {
+      return new Promise((resolve) => {
+        logger.debug(
+          { context: LOG_CONTEXT, connectionId: connection.id },
+          `${connection.id} finalized message is: ${finalizedMessage}`
+        );
+
+        logger.info({ context: LOG_CONTEXT, connectionId: connection.id }, `${connection.id} Adding mail to queue `);
+
+        const toAddress = getAddressTo(finalizedMessage);
+        const parts: string[] = toAddress.split('@');
+        const username: string = parts[0];
+        const domainPart: string = parts[1];
+
+        /*
+         * Legacy reply-to addresses encode the environmentId in the username segment
+         * (e.g. parse+txnId-nv-e=envId@domain). For plain domain-route addresses
+         * (e.g. support@customer.com) fall back to the domain part as the groupId
+         * so BullMQ can still bucket concurrent jobs by domain.
+         */
+        const groupId = username.includes('-nv-e=') ? username.split('-nv-e=').at(-1) : domainPart;
+
+        inboundMailService.inboundParseQueueService.add({
+          name: finalizedMessage.messageId,
+          data: finalizedMessage,
+          groupId,
+        });
+
+        return resolve();
+      });
+    }
+    function unlinkFile(connection) {
+      /* Don't forget to unlink the tmp file. */
+      return fs.promises.unlink(connection.mailPath).then(() => {
+        logger.info(
+          { context: LOG_CONTEXT, connectionId: connection.id },
+          `${connection.id} End processing message, deleted ${connection.mailPath}`
+        );
+      });
+    }
+
+    let _session;
+
+    function onData(stream, session, onDataCallback) {
+      try {
+        _session = session;
+        const connection = _.cloneDeep(session);
+        connection.id = uuidv4();
+        const mailPath = path.join(configuration.tmp, connection.id);
+        connection.mailPath = mailPath;
+
+        _this.emit('startData', connection);
+        logger.verbose({ context: LOG_CONTEXT, connectionId: connection.id }, `Connection id ${connection.id}`);
+        logger.info(
+          { context: LOG_CONTEXT, connectionId: connection.id },
+          `${connection.id} Receiving message from ${connection.envelope.mailFrom.address}`
+        );
+
+        _this.emit('startMessage', connection);
+
+        stream.pipe(fs.createWriteStream(mailPath));
+
+        stream.on('data', (chunk) => {
+          _this.emit('data', connection, chunk);
+        });
+
+        stream.on('end', () => {
+          dataReady(connection);
+          onDataCallback();
+        });
+
+        stream.on('close', () => {
+          _this.emit('close', connection);
+        });
+
+        stream.on('error', (error) => {
+          _this.emit('error', connection, error);
+        });
+      } catch (error) {
+        logger.error({ err: error, context: LOG_CONTEXT }, 'Exception occurred while performing onData callback');
+      }
+    }
+
+    function onAuth(auth, session, streamCallback) {
+      if (_this.emit('authorizeUser', session, auth.username, auth.password, streamCallback)) {
+        streamCallback(new Error('Unauthorized user'));
+      }
+    }
+
+    function onMailFrom(address, session, streamCallback) {
+      _this.emit('validateSender', session, address.address, streamCallback);
+      const ack = (err) => {
+        streamCallback(err);
+      };
+      validateAddress('sender', address.address, session.envelope).then(ack).catch(ack);
+    }
+
+    function onRcptTo(address, session, streamCallback) {
+      const ack = (err) => {
+        streamCallback(err);
+      };
+      _this.emit('validateRecipient', session, address.address, callback);
+      validateAddress('recipient', address.address, session.envelope).then(ack).catch(ack);
+    }
+
+    const smtpOptions = _.extend({}, configuration.smtpOptions || {}, {
+      onData,
+      onAuth,
+      onMailFrom,
+      onRcptTo,
+    });
+
+    await inboundMailService.start();
+
+    const server = new SMTPServer(smtpOptions);
+
+    this._smtp = server;
+
+    server.listen(configuration.port, configuration.host, () => {
+      logger.info({ context: LOG_CONTEXT }, `Mailin Smtp server listening on port ${configuration.port}`);
+    });
+
+    server.on('close', () => {
+      logger.info({ context: LOG_CONTEXT }, 'Closing smtp server');
+      _this.emit('close', _session);
+    });
+
+    server.on('error', (error) => {
+      callback(error);
+      if (configuration.port < 1000) {
+        logger.error({ context: LOG_CONTEXT }, 'Ports under 1000 require root privileges.');
+      }
+
+      logger.error({ err: error, context: LOG_CONTEXT }, 'Server errored');
+      _this.emit('error', _session, error);
+    });
+
+    callback();
+  }
+
+  public stop(callback: () => void) {
+    callback = callback || (() => {});
+    logger.info({ context: LOG_CONTEXT }, 'Stopping mailin.');
+
+    if (!this._smtp) {
+      callback();
+
+      return;
+    }
+
+    /*
+     * FIXME A bug in the RAI module prevents the callback to be called, so
+     * call end and call the callback directly.
+     */
+    this._smtp.close(callback);
+    callback();
+  }
+
+  public _convertTextToHtml(text) {
+    /* Replace newlines by <br>. */
+    text = text.replace(/(\n\r)|(\n)/g, '<br>');
+    /* Remove <br> at the beginning. */
+    text = text.replace(/^\s*(<br>)*\s*/, '');
+    /* Remove <br> at the end. */
+    text = text.replace(/\s*(<br>)*\s*$/, '');
+
+    return text;
+  }
+
+  public _convertHtmlToText(html) {
+    return convert(html);
+  }
+}
+
+function getAddressTo(finalizedMessage) {
+  const toAddressObject = Array.isArray(finalizedMessage.envelopeTo)
+    ? finalizedMessage.envelopeTo[0]
+    : finalizedMessage.envelopeTo;
+
+  return toAddressObject.address ?? toAddressObject;
+}
+interface ISmtpOptions {
+  banner: string;
+  logger: boolean;
+  disabledCommands: string[];
+  secure?: boolean;
+}
+
+interface IConfiguration {
+  host: string;
+  port: number;
+  tmp: string;
+  disableWebhook: boolean;
+  disableDkim: boolean;
+  disableSpf: boolean;
+  disableSpamScore: boolean;
+  verbose: boolean;
+  debug: boolean;
+  logLevel: string;
+  profile: boolean;
+  disableDNSValidation: boolean;
+  smtpOptions?: ISmtpOptions;
+  disableDnsLookup?: boolean;
+}
+
+export default new Mailin();
