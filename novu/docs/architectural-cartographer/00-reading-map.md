@@ -2,7 +2,7 @@
 
 ## Mental Model
 
-Novu is notification infrastructure: the dashboard lets a workspace configure workflows, subscribers, integrations, contexts, and activity; the API receives dashboard and external requests, validates/authenticates them, delegates to use cases, and stores domain state through DAL repositories backed by Mongo and related infrastructure (`README.md:63-70`, `package.json:50-65`, `apps/api/src/app.module.ts:109-156`, `docker/local/docker-compose.yml:18-56`).
+Novu is notification infrastructure: the dashboard lets a workspace configure workflows, subscribers, integrations, contexts, and activity; the API receives dashboard and external requests, validates/authenticates them, delegates to use cases, and stores domain state through DAL repositories backed by Mongo and related infrastructure (`README.md:70-84`, `package.json:50-65`, `apps/api/src/app.module.ts:109-156`, `docker/local/docker-compose.yml:18-56`).
 
 ## Top 10 Files To Read In Order
 

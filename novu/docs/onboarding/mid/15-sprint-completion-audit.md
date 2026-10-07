@@ -2,6 +2,8 @@
 
 This audit was written after reviewing the prior sprint work, the onboarding docs, and the current worktree.
 
+> **Status note (2026-10-06, frozen record).** A static re-check (no installs, no type-check, no tests) confirms the audit still describes the tree: the Sprint 1-3 code areas listed below exist (for example `apps/api/src/app/workflows-v2/usecases/sprint-one-workflow-tools`, `libs/dal/src/repositories/trigger-reliability`, `packages/shared/src/utils/provider-failure-classification.ts`, `provider-operations-panel.tsx`); the Sprint 5 replay guard is present as `REPLAY_DEDUP_WINDOW_MS = 60_000` in `apps/api/src/app/activity/usecases/replay-workflow-run/replay-workflow-run.usecase.ts`; and Sprint 4 is still unimplemented — none of the use case or DTO paths proposed in `12-sprint-4-junior-implementation-plan.md` (topic subscriber import, API key naming, integration export/import, in-app retention, subscriber merge, tenant schedule) exist. The type-check below has still not been run.
+
 ## Summary
 
 Sprints 1, 2, 3, and 5 have code-backed implementation notes and corresponding repository changes. Sprint 4 is documented as an implementation plan only; it has not been implemented as a completed sprint in this worktree.

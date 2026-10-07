@@ -45,9 +45,26 @@ Before your first PR, you must be able to explain the difference between `Notifi
 14. `mid/14-sprint-5-implementation-notes.md`
 15. `mid/15-sprint-completion-audit.md`
 
+Sprint status in one line: Sprints 1, 2, 3 and 5 have code in this repository; Sprint 4 (`mid/12-…`) is a plan only — none of its proposed use case or DTO folders exist yet (re-checked 2026-10-06). Read the implementation notes as "what was built", the Sprint 4 plan as an exercise.
+
 Start here in 5 minutes: Novu's core pattern is controller/use case/repository plus queue/worker/provider. Most bugs come from crossing those boundaries without preserving tenant scope or retry semantics.
 
 Before your first PR, you must be able to trace `POST /v1/events/trigger` through `ParseEventRequest`, `WorkflowWorker`, `SubscriberProcessWorker`, `StandardWorker`, and the provider factory.
+
+### Trigger path anchors (checked 2026-10-06)
+
+Use these as the starting points for that trace; paths are relative to the `novu/` app directory.
+
+| Stage | Where to start reading |
+| --- | --- |
+| HTTP entry | `apps/api/src/app/events/events.controller.ts:88` — `@Post('/trigger')` on the `events` controller; the `v1` prefix comes from `enableVersioning` with `defaultVersion: '1'` in `apps/api/src/bootstrap.ts:76-79` |
+| Request parsing + enqueue | `apps/api/src/app/events/usecases/parse-event-request/parse-event-request.usecase.ts:79` (`ParseEventRequest`); it hands work to `WorkflowQueueService` at `:409` |
+| Workflow fan-out | `apps/worker/src/app/workflow/services/workflow.worker.ts:23` (`WorkflowWorker`) |
+| Per-subscriber processing | `apps/worker/src/app/workflow/services/subscriber-process.worker.ts:33`, processor at `:57` |
+| Job execution | `apps/worker/src/app/workflow/services/standard.worker.ts:33`, processor at `:121`, `RunJob` call at `:161`, failure handling from `:244` |
+| Provider selection | `libs/application-generic/src/factories/` — `mail/`, `sms/`, `chat/`, `push/` factories plus the shared `channel.factory.ts` interface |
+
+The test that exercises this path end to end is `apps/api/src/app/events/e2e/trigger-event.e2e.ts`, the largest e2e file in the repo (see `senior/05-codebase-health.md`).
 
 ## Senior Path
 
